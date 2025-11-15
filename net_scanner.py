@@ -1,3 +1,4 @@
+## python -m pip install -r requirements.txt
 import sys
 from datetime import datetime
 from dataclasses import dataclass, field
