@@ -3,11 +3,15 @@ from datetime import datetime
 from dataclasses import dataclass, field
 import socket
 import ipaddress
-import nettest
+import netifaces
 from PyQt5 import QtWidgets, QtCore, QtGui
 from scapy.all import arping, conf  # type: ignore
 
-## class for scan data.
+# Local OUI database
+from manuf import manuf
+_OUI = manuf.MacParser(update=False)
+
+
 @dataclass
 class Device:
     ip: str
@@ -15,18 +19,19 @@ class Device:
     first_seen: datetime = field(default_factory=datetime.utcnow)
     last_seen: datetime = field(default_factory=datetime.utcnow)
     online: bool = True
-    misses: int = 0  # consecutive scans not seen
-    name: str = ""   # reverse-DNS or fallback to IP when rendering
+    misses: int = 0            # consecutive scans not seen
+    name: str = ""             # reverse DNS
+    vendor: str = ""           # OUI manufacturer if found
 
-## define 
+
 def current_ipv4_network() -> ipaddress.IPv4Network:
     try:
-        gw = nettest.gateways().get('default', {}).get(nettest.AF_INET)
+        gw = netifaces.gateways().get('default', {}).get(netifaces.AF_INET)
         if gw:
             _, iface = gw
         else:
             _, _, iface = conf.route.route("0.0.0.0")
-        addrs = nettest.ifaddresses(iface)[nettest.AF_INET][0]
+        addrs = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]
         ip = addrs["addr"]
         mask = addrs["netmask"]
         prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
@@ -42,9 +47,7 @@ def arp_scan(cidr: str, timeout: int = 2):
 
 
 def resolve_name(ip: str) -> str:
-    # Keep this quick; reverse DNS only. If none, return "" and UI will show IP.
     try:
-        # gethostbyaddr has no per-call timeout; set global for worker thread.
         orig_to = socket.getdefaulttimeout()
         socket.setdefaulttimeout(1.0)
         try:
@@ -54,6 +57,32 @@ def resolve_name(ip: str) -> str:
             socket.setdefaulttimeout(orig_to)
     except Exception:
         return ""
+
+
+def _normalize_mac(mac: str) -> str:
+    mac = mac.strip().replace("-", ":").lower()
+    if ":" not in mac and len(mac) == 12:
+        mac = ":".join(mac[i:i+2] for i in range(0, 12, 2))
+    return mac
+
+
+def _is_locally_administered(mac: str) -> bool:
+    try:
+        first_octet = int(mac.split(":")[0], 16)
+        return bool(first_octet & 0b10)
+    except Exception:
+        return False
+
+
+def lookup_vendor(mac: str) -> str:
+    mac_n = _normalize_mac(mac)
+    if not mac_n or _is_locally_administered(mac_n):
+        return ""
+    try:
+        return _OUI.get_manuf(mac_n) or ""
+    except Exception:
+        return ""
+
 
 class ScannerWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list)  # list[(ip, mac)]
@@ -71,12 +100,12 @@ class ScannerWorker(QtCore.QObject):
         except Exception as e:
             self.error.emit(str(e))
 
-
+## QTPy Main window UI
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LAN Scanner")
-        self.resize(980, 520)
+        self.setWindowTitle("Network Scanner v1")
+        self.resize(1040, 540)
 
         self.devices: dict[str, Device] = {}
         self.scanning = False
@@ -87,6 +116,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
         v = QtWidgets.QVBoxLayout(root)
 
+        # Controls
         ctrl = QtWidgets.QHBoxLayout()
         self.lblSubnet = QtWidgets.QLabel("Subnet: resolving...")
         self.btnScan = QtWidgets.QPushButton("Scan now")
@@ -104,18 +134,39 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl.addWidget(self.btnScan)
         v.addLayout(ctrl)
 
-        # Columns: Name, IP, MAC, First seen, Last seen, Status
-        self.table = QtWidgets.QTableWidget(0, 6)
+        # Table: State, Name, IP, MAC, Manufacturer, First seen, Last seen
+        self.table = QtWidgets.QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Name", "IP", "MAC", "First seen (UTC)", "Last seen (UTC)", "Status"]
+            ["State", "Name", "IP", "MAC", "Manufacturer", "First seen (UTC)", "Last seen (UTC)"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         v.addWidget(self.table)
+        self.table.setColumnWidth(0, 48)  # compact State column
+        self.table.setColumnWidth(2, 144)
+        self.table.setColumnWidth(3, 144)
+        self.table.setColumnWidth(4, 144)
+        self.table.setColumnWidth(5, 144)
 
         self.network = current_ipv4_network()
         self.lblSubnet.setText(f"Subnet: {self.network.with_prefixlen}")
+
+        # Status icons
+        self.icon_green = self._make_color_icon(QtGui.QColor(0, 170, 0))
+        self.icon_grey = self._make_color_icon(QtGui.QColor(130, 130, 130))
+
+    def _make_color_icon(self, color: QtGui.QColor, size: int = 14) -> QtGui.QIcon:
+        pm = QtGui.QPixmap(size, size)
+        pm.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setPen(QtGui.QPen(color))
+        p.setBrush(QtGui.QBrush(color))
+        rect = QtCore.QRectF(1, 1, size - 2, size - 2)
+        p.drawRoundedRect(rect, 3, 3)
+        p.end()
+        return QtGui.QIcon(pm)
 
     def toggle_auto(self, state: int):
         if state == QtCore.Qt.Checked:
@@ -145,39 +196,43 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(list)
     def on_scan_finished(self, results: list):
-        now = datetime.datetime.now(datetime.UTC)
+        now = datetime.utcnow()
         found_ips = set(ip for ip, _ in results)
 
-        # Update or add seen devices
+        # Update/add seen devices
         for ip, mac in results:
+            mac_n = _normalize_mac(mac)
             if ip in self.devices:
                 d = self.devices[ip]
-                # If MAC changed
-                mac_changed = d.mac.lower() != mac.lower()
-                d.mac = mac
+                mac_changed = d.mac.lower() != mac_n.lower()
+                d.mac = mac_n
                 d.last_seen = now
                 d.online = True
                 d.misses = 0
-                # Refresh name if empty
                 if not d.name:
                     d.name = resolve_name(ip)
+                if mac_changed or not d.vendor:
+                    d.vendor = lookup_vendor(mac_n)
             else:
-                name = resolve_name(ip)
                 self.devices[ip] = Device(
-                    ip=ip, mac=mac, first_seen=now, last_seen=now,
-                    online=True, misses=0, name=name
+                    ip=ip,
+                    mac=mac_n,
+                    first_seen=now,
+                    last_seen=now,
+                    online=True,
+                    misses=0,
+                    name=resolve_name(ip),
+                    vendor=lookup_vendor(mac_n),
                 )
 
-        # Increment misses for unseen devices and mark offline
+        # Increment misses for unseen devices; prune after second miss
         to_delete = []
         for ip, dev in list(self.devices.items()):
             if ip not in found_ips:
                 dev.online = False
                 dev.misses += 1
-                # Remove after two consecutive misses (third scan total)
-                if dev.misses >= 2:
+                if dev.misses >= 2:  # third scan not seen -> remove
                     to_delete.append(ip)
-
         for ip in to_delete:
             del self.devices[ip]
 
@@ -194,31 +249,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnScan.setEnabled(True)
 
     def refresh_table(self):
-        # Sort by IP
         rows = sorted(self.devices.values(), key=lambda d: tuple(int(x) for x in d.ip.split(".")))
         self.table.setRowCount(len(rows))
         for r, dev in enumerate(rows):
             display_name = dev.name if dev.name else dev.ip
-            cells = [
-                QtWidgets.QTableWidgetItem(display_name),
-                QtWidgets.QTableWidgetItem(dev.ip),
-                QtWidgets.QTableWidgetItem(dev.mac),
-                QtWidgets.QTableWidgetItem(dev.first_seen.strftime("%Y-%m-%d %H:%M:%S")),
-                QtWidgets.QTableWidgetItem(dev.last_seen.strftime("%Y-%m-%d %H:%M:%S")),
-                QtWidgets.QTableWidgetItem("online" if dev.online else f"offline - misses {dev.misses}"),
-            ]
-            for c, itm in enumerate(cells):
-                # Grey out if offline
-                if not dev.online:
+
+            # State icon
+            state_item = QtWidgets.QTableWidgetItem()
+            if dev.online:
+                state_item.setIcon(self.icon_green)
+                state_item.setToolTip("Online")
+            elif dev.misses == 1:
+                state_item.setIcon(self.icon_grey)
+                state_item.setToolTip("Did not respond on the second scan")
+            else:
+                state_item.setToolTip("Offline")
+
+            name_item = QtWidgets.QTableWidgetItem(display_name)
+            ip_item = QtWidgets.QTableWidgetItem(dev.ip)
+            mac_item = QtWidgets.QTableWidgetItem(dev.mac)
+            vendor_item = QtWidgets.QTableWidgetItem(dev.vendor)
+            first_item = QtWidgets.QTableWidgetItem(dev.first_seen.strftime("%Y-%m-%d %H:%M:%S"))
+            last_item = QtWidgets.QTableWidgetItem(dev.last_seen.strftime("%Y-%m-%d %H:%M:%S"))
+
+            # Grey text for offline rows
+            items = [name_item, ip_item, mac_item, vendor_item, first_item, last_item]
+            if not dev.online:
+                for itm in items:
                     itm.setForeground(QtGui.QBrush(QtGui.QColor("gray")))
-                else:
+            else:
+                for itm in items:
                     itm.setForeground(QtGui.QBrush())
-                # Monospace for IP/MAC
-                if c in (1, 2):
-                    f = itm.font()
-                    f.setFamily("Consolas")
-                    itm.setFont(f)
-                self.table.setItem(r, c, itm)
+
+            # Monospace for IP/MAC
+            for itm in (ip_item, mac_item):
+                f = itm.font()
+                f.setFamily("Consolas")
+                itm.setFont(f)
+
+            # Insert into table (no Status column now)
+            self.table.setItem(r, 0, state_item)
+            self.table.setItem(r, 1, name_item)
+            self.table.setItem(r, 2, ip_item)
+            self.table.setItem(r, 3, mac_item)
+            self.table.setItem(r, 4, vendor_item)
+            self.table.setItem(r, 5, first_item)
+            self.table.setItem(r, 6, last_item)
 
 
 def main():
