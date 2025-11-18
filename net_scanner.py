@@ -25,7 +25,13 @@ class Device:
     vendor: str = ""           # OUI manufacturer if found
 
 
-def current_ipv4_network() -> ipaddress.IPv4Network:
+def current_ipv4_network(manual_cidr: str = None) -> ipaddress.IPv4Network:
+    if manual_cidr:
+        try:
+            return ipaddress.IPv4Network(manual_cidr, strict=False)
+        except Exception:
+            print(f"Invalid manual CIDR: {manual_cidr}, falling back to auto-detection")
+    
     try:
         gw = netifaces.gateways().get('default', {}).get(netifaces.AF_INET)
         if gw:
@@ -33,14 +39,13 @@ def current_ipv4_network() -> ipaddress.IPv4Network:
         else:
             _, _, iface = conf.route.route("0.0.0.0")
         addrs = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]
-        ip = addrs["addr"]
-        mask = addrs["netmask"]
+        ip = addrs["addr"]  # REMOVED hardcoded value
+        mask = addrs["netmask"]  # REMOVED hardcoded value
         prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
         return ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
     except Exception:
         src = conf.route.route("0.0.0.0")[1]
         return ipaddress.IPv4Network(f"{src}/24", strict=False)
-
 
 def arp_scan(cidr: str, timeout: int = 2):
     ans, _ = arping(cidr, timeout=timeout, verbose=False)
@@ -149,8 +154,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setColumnWidth(3, 144)
         self.table.setColumnWidth(4, 144)
         self.table.setColumnWidth(5, 144)
+        
+        
+        ## Automatic Detection00
+        #self.network = current_ipv4_network()
 
-        self.network = current_ipv4_network()
+        ## Manual Detection
+        self.network = current_ipv4_network("10.4.1.0/24")
+
         self.lblSubnet.setText(f"Subnet: {self.network.with_prefixlen}")
 
         # Status icons
